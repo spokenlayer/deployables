@@ -570,15 +570,15 @@ function copy_lambda_to_s3 () {
 
     aws_configure
 
-    aws --profile "${DEPLOY_AWS_PROFILE}" \
-        s3 cp \
-        ${DEPLOY_LAMBDA_ZIP_FULLPATH} \
-        s3://${DEPLOY_LAMBDA_S3_BUCKET}/${DEPLOY_LAMBDA_FUNCTION_NAME}/archive/${DEPLOY_LAMBDA_FUNCTION_NAME}-${DEPLOY_SHA1}.zip
-
-    if [[ "$?" != "0" ]] ; then
-        echo "Error: Failed to copy lambda zip to S3 (${DEPLOY_SHA1})"
-        exit 1
-    fi
+    # aws --profile "${DEPLOY_AWS_PROFILE}" \
+    #     s3 cp \
+    #     ${DEPLOY_LAMBDA_ZIP_FULLPATH} \
+    #     s3://${DEPLOY_LAMBDA_S3_BUCKET}/${DEPLOY_LAMBDA_FUNCTION_NAME}/archive/${DEPLOY_LAMBDA_FUNCTION_NAME}-${DEPLOY_SHA1}.zip
+    #
+    # if [[ "$?" != "0" ]] ; then
+    #     echo "Error: Failed to copy lambda zip to S3 (${DEPLOY_SHA1})"
+    #     exit 1
+    # fi
 
     if [ ! -z "${DEPLOY_LAMBDA_ZIP_VERSION}" ] ; then
       aws --profile "${DEPLOY_AWS_PROFILE}" \
