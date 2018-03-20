@@ -580,7 +580,7 @@ function copy_lambda_to_s3 () {
     #     exit 1
     # fi
 
-    if [ ! -z "${DEPLOY_LAMBDA_ZIP_VERSION}" ] ; then
+  #  if [ ! -z "${DEPLOY_LAMBDA_ZIP_VERSION}" ] ; then
       aws --profile "${DEPLOY_AWS_PROFILE}" \
           s3 cp \
           ${DEPLOY_LAMBDA_ZIP_FULLPATH} \
@@ -591,7 +591,7 @@ function copy_lambda_to_s3 () {
           exit 1
       fi
 
-    fi
+  #  fi
 
 }
 
