@@ -221,6 +221,48 @@ function ecr_push_image () {
 
 }
 
+function ecs_update_task_image () {
+  ##
+  ## Updates just the imgage of an existing task
+  ##
+
+   #Avoid using echo as we use it to "return" the task arn from the function
+
+    local image="$1"
+    local family="$2"
+
+    previous_task=$( \
+        aws ecs describe-task-definition \
+            --profile ${DEPLOY_AWS_PROFILE} \
+            --task-definition ${family}
+    )
+
+    #create new task def json from previous task
+
+    task_def=$( \
+        echo ${previous_task} | $JQ --arg IMAGE "${image}" '.taskDefinition.containerDefinitions[0].image = $IMAGE' \
+            | $JQ '.taskDefinition' \
+            | $JQ 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities)'
+    )
+
+    echo ${task_def}> fulltask_${family}.json
+
+    register_task=$( \
+        aws ecs register-task-definition \
+            --profile ${DEPLOY_AWS_PROFILE} \
+            --cli-input-json file://fulltask_${family}.json
+    )
+
+    task_arn=$( \
+        echo ${register_task} | $JQ '.taskDefinition.taskDefinitionArn'
+    )
+
+    echo "export ECS_TASK_ARN_${family}=$task_arn" >> $BASH_ENV
+    echo $task_arn
+
+}
+
+
 function ecs_deploy_task () {
 
     local image="$1"
@@ -796,13 +838,24 @@ function lambda_deploy_event () {
 
 
     # create or update a cloudwatch event rule
-    event_rule_arn=$( \
-        aws events put-rule \
-            --profile "${DEPLOY_AWS_PROFILE}" \
-            --name "${event_rule_name}" \
-            --schedule-expression "${DEPLOY_LAMBDA_EVENT_RULE}" \
-            | $JQ ".RuleArn"
-    )
+    if jq -e . >/dev/null 2>&1 <<<"${DEPLOY_LAMBDA_EVENT_RULE}" ; then
+      # using json file!
+        event_rule_arn=$( \
+            aws events put-rule \
+                --profile "${DEPLOY_AWS_PROFILE}" \
+                --cli-input-json "${DEPLOY_LAMBDA_EVENT_RULE}" \
+                | $JQ ".RuleArn"
+        )
+    else
+        # using schedule expression (direct)
+        event_rule_arn=$( \
+            aws events put-rule \
+                --profile "${DEPLOY_AWS_PROFILE}" \
+                --name "${event_rule_name}" \
+                --schedule-expression "${DEPLOY_LAMBDA_EVENT_RULE}" \
+                | $JQ ".RuleArn"
+        )
+    fi
 
     # NB this can fail if the permission doesn't exist, this is ok.
     aws lambda remove-permission \
