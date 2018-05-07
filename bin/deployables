@@ -62,7 +62,7 @@ function aws_configure {
     echo
 
     if [[ -n $aws_configure_done ]]; then
-        return
+      return
     fi
 
     if [ -z "${DEPLOY_AWS_ACCOUNT}" ] ; then
@@ -71,10 +71,26 @@ function aws_configure {
     fi
 
     aws --version
+#    aws configure set default.region ${DEPLOY_AWS_REGION}
+#    aws configure set default.output json
 
-    mkdir -p "$(dirname "$( eval echo -n $DEPLOY_AWS_CONFIG )")"
+    # circle v2 hack
+    if [ ! -d ~/.aws ] ; then
+        mkdir -p ~/.aws
 
-    cat > "$( eval echo -n $DEPLOY_AWS_CONFIG )" <<EOH
+        cat >> "$( eval echo -n ~/.aws/credentials )" <<EOH
+[${DEPLOY_AWS_SOURCE_PROFILE}]
+aws_access_key_id=${AWS_ACCESS_KEY_ID}
+aws_secret_access_key=${AWS_SECRET_ACCESS_KEY}
+EOH
+
+        cat >> "$( eval echo -n $DEPLOY_AWS_CONFIG )" <<EOH
+[profile ${DEPLOY_AWS_SOURCE_PROFILE}]
+region=${DEPLOY_AWS_REGION}
+EOH
+    fi
+
+    cat >> "$( eval echo -n $DEPLOY_AWS_CONFIG )" <<EOH
 ## added by deployables.aws_configure()
 [profile ${DEPLOY_AWS_PROFILE}]
 role_arn = arn:aws:iam::${DEPLOY_AWS_ACCOUNT}:role/${DEPLOY_AWS_ROLE}
@@ -87,8 +103,6 @@ EOH
         echo "Error updating aws config, DEPLOY_AWS_CONFIG=${DEPLOY_AWS_CONFIG}"
         exit 1
     fi
-
-    cat '$( eval echo -n $DEPLOY_AWS_CONFIG )'
 
     aws_configure_done=1
 }
