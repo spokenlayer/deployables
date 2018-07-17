@@ -523,7 +523,7 @@ function _deploy_image () {
 
     else
 
-        target_tag="${DEPLOY_ECR_HOST}/${DEPLOY_APP_NAME}:$( date +%Y%m%d )-${DEPLOY_SHA1}"
+        target_tag="${DEPLOY_ECR_HOST}/${DEPLOY_APP_NAME}:$( date +%s%3N )-${DEPLOY_SHA1}"
 
         echo
         echo Pushing primary tag
