@@ -523,7 +523,7 @@ function _deploy_image () {
     else
 
         target_tag="${DEPLOY_ECR_HOST}/${DEPLOY_APP_NAME}:$( date +%Y%m%d )-$( date +%s )-${DEPLOY_SHA1}"
-
+        echo "export ECS_TARGET_TAG=$target_tag" >> $BASH_ENV
         echo
         echo Pushing primary tag
         echo target_tag: ${target_tag}
