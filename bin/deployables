@@ -233,6 +233,78 @@ function ecr_push_image () {
 
 }
 
+function ecs_update_service_task_image () {
+    ##
+    ## SpokenLayer hack
+    ##
+
+    local service=$1
+    local family=$2
+
+    var="ECS_TASK_ARN_$( echo $family )"
+    ECS_TASK_ARN=${!var}
+
+    revision_actual=$( \
+          aws ecs update-service \
+          --profile ${DEPLOY_AWS_PROFILE} \
+          --cluster ${DEPLOY_ECS_CLUSTER_NAME} \
+          --service ${service} \
+          --task-definition $ECS_TASK_ARN \
+          | $JQ '.service.taskDefinition' \
+      )
+
+    revision_target=$( \
+            aws ecs describe-task-definition \
+            --profile ${DEPLOY_AWS_PROFILE} \
+            --task-definition $ECS_TASK_ARN
+    )
+
+    if [ "$revision_target" != "$revision_actual" ] ; then
+        echo "Error updating service. Target does not match actual: ${revision_target} != ${revision_actual} "
+        exit 1
+    fi
+}
+
+function ecs_verify_service_update () {
+
+    local service=$1
+    local family=$2
+
+    var="ECS_TASK_ARN_$( echo $family )"
+    ECS_TASK_ARN=${!var}
+
+    echo
+    echo Verifying deploy
+    echo revision_target: $revision_target
+    echo
+
+    # wait for older revisions to disappear
+    for ((n=0;n<100;n++)); do
+
+        revision_deployed=$( \
+                aws ecs describe-services \
+                --profile ${DEPLOY_AWS_PROFILE} \
+                --cluster ${DEPLOY_ECS_CLUSTER_NAME} \
+                --services ${service} \
+                | $JQ ".services[0].deployments | .[] | select(.taskDefinition != \"$ECS_TASK_ARN\") | .taskDefinition" \
+            )
+
+        if [ -z "$revision_deployed" ] ; then
+            echo "Success: Deployed!"
+            return 0
+        fi
+
+        echo "Waiting for update:"
+        echo "  revision_target: ${ECS_TASK_ARN}"
+        echo "  revision_deployed: ${revision_deployed}"
+        sleep 6
+
+    done
+
+    echo "Error: Service update took too long."
+    exit 1
+}
+
 function ecs_update_task_image () {
     ##
     ## Updates just the imgage of an existing task
@@ -524,6 +596,7 @@ function _deploy_image () {
 
         target_tag="${DEPLOY_ECR_HOST}/${DEPLOY_APP_NAME}:$( date +%Y%m%d )-$( date +%s )-${DEPLOY_SHA1}"
         echo "export ECS_TARGET_TAG=$target_tag" >> $BASH_ENV
+
         echo
         echo Pushing primary tag
         echo target_tag: ${target_tag}
