@@ -253,14 +253,8 @@ function ecs_update_service_task_image () {
           | $JQ '.service.taskDefinition' \
       )
 
-    revision_target=$( \
-            aws ecs describe-task-definition \
-            --profile ${DEPLOY_AWS_PROFILE} \
-            --task-definition $ECS_TASK_ARN
-    )
-
-    if [ "$revision_target" != "$revision_actual" ] ; then
-        echo "Error updating service. Target does not match actual: ${revision_target} != ${revision_actual} "
+    if [ "$ECS_TASK_ARN" != "$revision_actual" ] ; then
+        echo "Error updating service. Target does not match actual: $ECS_TASK_ARN != ${revision_actual} "
         exit 1
     fi
 }
