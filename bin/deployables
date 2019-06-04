@@ -22,6 +22,14 @@ else
   echo "Info: DEPLOY_ENV_FILE is not defined"
 fi
 
+##
+## JDSIPES - fast hack to get old lambda-s3 configs to deploy
+##
+if [[ -z "${DEPLOY_LAMBDA_FUNCTION_NAME}" ]] && [[ ! -z "${LAMBDA_FUNCTION_NAME}" ]] ; then  
+    echo "Update LAMBDA_FUNCTION_NAME to be DEPLOY_LAMBDA_FUNCTION_NAME"
+    DEPLOY_LAMBDA_FUNCTION_NAME=${LAMBDA_FUNCTION_NAME}
+fi
+
 #
 # optional
 #
