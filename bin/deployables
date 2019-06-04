@@ -6,14 +6,21 @@
 ## configure debugging
 ##
 
-if [ ! -z "${DEPLOY_DEBUG}" ] ; then
+if [[ ! -z "${DEPLOY_DEBUG}" ]] ; then
     set -x
 fi
-
 
 ##
 ## environment variables
 ##
+
+# circle v2 hack: source env file
+if [[ ! -z "${DEPLOY_ENV_FILE}" ]] ; then
+  echo DEPLOY_ENV_FILE: $DEPLOY_ENV_FILE
+  source $DEPLOY_ENV_FILE
+else
+  echo "Info: DEPLOY_ENV_FILE is not defined"
+fi
 
 #
 # optional
@@ -35,6 +42,7 @@ DEPLOY_SHA1="${DEPLOY_SHA1:-$CIRCLE_SHA1}"
 # more bash-friendly output for jq
 JQ="jq --raw-output --exit-status"
 
+DEPLOY_CURRENT_TIME="$(date +%Y%m%d)"
 
 
 ##
@@ -43,12 +51,12 @@ JQ="jq --raw-output --exit-status"
 
 function check_environment {
 
-    if [ -z "${DEPLOY_AWS_ACCOUNT}" ] ; then
+    if [[ -z "${DEPLOY_AWS_ACCOUNT}" ]] ; then
         echo "Error: DEPLOY_AWS_ACCOUNT is required"
         exit 1
     fi
 
-    if [ -z "${DEPLOY_ECR_ACCOUNT}" ] ; then
+    if [[ -z "${DEPLOY_ECR_ACCOUNT}" ]] ; then
         echo "Error: DEPLOY_ECR_ACCOUNT is required"
         exit 1
     fi
@@ -65,14 +73,28 @@ function aws_configure {
       return
     fi
 
-    if [ -z "${DEPLOY_AWS_ACCOUNT}" ] ; then
+    if [[ -z "${DEPLOY_AWS_ACCOUNT}" ]] ; then
         echo "Error: DEPLOY_AWS_ACCOUNT is required"
         exit 1
     fi
 
     aws --version
-#    aws configure set default.region ${DEPLOY_AWS_REGION}
-#    aws configure set default.output json
+
+    # circle v2 hack
+    if [[ ! -d ~/.aws ]] ; then
+        mkdir -p ~/.aws
+
+        cat >> $( eval echo -n ~/.aws/credentials ) <<EOH
+[${DEPLOY_AWS_SOURCE_PROFILE}]
+aws_access_key_id=${AWS_ACCESS_KEY_ID}
+aws_secret_access_key=${AWS_SECRET_ACCESS_KEY}
+EOH
+
+        cat >> $( eval echo -n $DEPLOY_AWS_CONFIG ) <<EOH
+[profile ${DEPLOY_AWS_SOURCE_PROFILE}]
+region=${DEPLOY_AWS_REGION}
+EOH
+    fi
 
     # circle v2 hack
     if [ ! -d ~/.aws ] ; then
@@ -112,6 +134,73 @@ function aws_test_profile {
   aws --profile=${DEPLOY_AWS_PROFILE} s3 ls
 }
 
+function aws_run () {
+  aws_configure
+  aws --profile=${DEPLOY_AWS_PROFILE} ${@:1}
+}
+
+##
+## docker
+##
+
+function docker_build {
+
+    echo
+    echo Building docker image
+    echo DEPLOY_DOCKERFILE: ${DEPLOY_DOCKERFILE}
+    echo DEPLOY_DOCKER_LOCAL_TAG: ${DEPLOY_DOCKER_LOCAL_TAG}
+    echo
+
+    if [[ -z "${DEPLOY_DOCKERFILE}" ]] ; then
+        echo "Error: DEPLOY_DOCKERFILE is required"
+        return 1
+    fi
+
+    if [[ -z "${DEPLOY_DOCKER_LOCAL_TAG}" ]] ; then
+        echo "Error: DEPLOY_DOCKER_LOCAL_TAG is required"
+        return 1
+    fi
+
+    if [[ ! -z "${DEPLOY_GITHUB_MACHINE_USER_KEY_FINGERPRINT}" ]] ; then
+
+        fingerprint="$( echo ${DEPLOY_GITHUB_MACHINE_USER_KEY_FINGERPRINT} | tr -d : )"
+
+        eval keyfile="~/.ssh/id_${fingerprint}"
+
+        if [[ ! -f ${keyfile} ]] ; then
+            echo "Error: Unable to find machine user key file"
+            echo "- fingerprint: ${fingerprint}"
+            echo "- keyfile: ${keyfile}"
+
+            eval keyfile="~/.ssh/id_circleci_github"
+
+            if [[ ! -f ${keyfile} ]] ; then
+                echo "Error: Unable to find circle github key file"
+                echo "- keyfile: ${keyfile}"
+                return 1
+            fi
+
+        fi
+
+        echo "Using GITHUB_MACHINE_USER_KEY=${keyfile}"
+
+    fi
+
+    docker build \
+        --rm=false \
+        ${NPM_TOKEN:+ --build-arg NPM_TOKEN=$NPM_TOKEN}\
+        ${keyfile:+ --build-arg GITHUB_MACHINE_USER_KEY="$(< ${keyfile} )"} \
+        -t ${DEPLOY_DOCKER_LOCAL_TAG} \
+        -f ${DEPLOY_DOCKERFILE} \
+        .
+
+}
+
+
+##
+## ecr
+##
+
 function ecr_login () {
 
     echo
@@ -125,7 +214,7 @@ function ecr_login () {
     check_environment
 
     login_command=$(
-        aws --profile=${DEPLOY_AWS_PROFILE} ecr get-login
+        aws --profile=${DEPLOY_AWS_PROFILE} ecr get-login --no-include-email
     )
 
     if [[ ! "$login_command" =~ "https://${DEPLOY_AWS_ACCOUNT}" ]]; then
@@ -137,7 +226,8 @@ function ecr_login () {
 
      login_command=$(
         echo ${login_command} \
-        | sed -e "s/${DEPLOY_AWS_ACCOUNT}/${DEPLOY_ECR_ACCOUNT}/"
+        | sed -e "s/${DEPLOY_AWS_ACCOUNT}/${DEPLOY_ECR_ACCOUNT}/" \
+        | sed -e "s/-e none//"
     )
 
     if [[ ! "$login_command" =~ "https://${DEPLOY_ECR_ACCOUNT}" ]]; then
@@ -208,43 +298,39 @@ function ecr_push_image () {
 
     docker push $image
 
-    if [ $? != 0 ] ; then
+    if [[ $? != 0 ]] ; then
         echo "Error: Unable to push image, ${image}"
         exit 1
     fi
 
 }
 
+##
+## ecs
+##
+
 function ecs_deploy_task () {
 
-    local image="$1"
+    local image_tag="$1"
     local subfamily="$2"
+
+    local ecr_repo_name="${DEPLOY_ECR_REPO:-$DEPLOY_APP_NAME}"
+
+    local image="${DEPLOY_ECR_HOST}/${ecr_repo_name}:${image_tag}"
 
     echo
     echo Deploying ECS task
-    echo image: ${image}
+    echo image_tag: ${image_tag}
     echo subfamily: ${subfamily}
+    echo image: ${image}
     echo
 
-    if [ -z "$subfamily" ] ; then
+    if [[ -z "$subfamily" ]] ; then
         family="${DEPLOY_APP_NAME}"
-        service="${DEPLOY_APP_NAME}"
     else
         family="${DEPLOY_APP_NAME}-${subfamily}"
-        service="${DEPLOY_APP_NAME}-${subfamily}"
     fi
-
-    echo
-    echo "Remembering current task definition, family: ${family}"
-    echo
-
-    previous_version=$( \
-        aws ecs describe-services \
-            --profile ${DEPLOY_AWS_PROFILE} \
-            --cluster ${DEPLOY_ECS_CLUSTER_NAME} \
-            --services ${service} \
-            | $JQ '.services[0].taskDefinition' \
-    )
+    service="${family}"
 
     echo
     echo "Registering new task definition, family: ${family}"
@@ -259,36 +345,43 @@ function ecs_deploy_task () {
 
     task_def=$( \
         DEPLOY_IMAGE_NAME=${image} \
+        DEPLOY_IMAGE_TAG=${image_tag} \
         DEPLOY_ECS_CLUSTER_NAME=${DEPLOY_ECS_CLUSTER_NAME} \
         DEPLOY_SUBFAMILY=${subfamily} \
         DEPLOY_AWS_REGION=${DEPLOY_AWS_REGION} \
+        DEPLOY_APP_NAME=${family} \
         ${DEPLOY_ENVSUBST_COMMAND:-envsubst} < "${task_def_template}"
     )
 
-    if [[ -z "${DEPLOY_TASK_ROLE_ARN}" ]] ; then
-        revision_target=$( \
-            aws ecs register-task-definition \
-                --profile ${DEPLOY_AWS_PROFILE} \
-                --container-definitions "$task_def" \
-                --family "${family}" \
-                | $JQ '.taskDefinition.taskDefinitionArn' \
-        )
-    else
-        revision_target=$( \
-            aws ecs register-task-definition \
-                --profile ${DEPLOY_AWS_PROFILE} \
-                --task-role-arn "${DEPLOY_TASK_ROLE_ARN}" \
-                --container-definitions "$task_def" \
-                --family "${family}" \
-                | $JQ '.taskDefinition.taskDefinitionArn' \
-        )
+    if [[ "${DEPLOY_ECS_REQUIRES_COMPATIBILITIES}" == "FARGATE" ]] ; then
+        echo "Info: DEPLOY_ECS_REQUIRES_COMPATIBILITIES is FARGATE"
+        requires_fargate="yes"
     fi
 
-    if [ -z "$revision_target" ] ; then
+    revision_target=$( \
+        aws ecs register-task-definition \
+            --profile ${DEPLOY_AWS_PROFILE} \
+            --family "${family}" \
+            --container-definitions "$task_def" \
+            ${requires_fargate:+ --requires-compatibilities FARGATE} \
+            ${requires_fargate:+ --network-mode awsvpc} \
+            ${requires_fargate:+ --cpu ${DEPLOY_ECS_FARGATE_CPU:-256}} \
+            ${requires_fargate:+ --memory ${DEPLOY_ECS_FARGATE_MEMORY:-512}} \
+            ${DEPLOY_ECS_EXECUTION_ROLE_NAME:+ --execution-role-arn arn:aws:iam::${DEPLOY_AWS_ACCOUNT}:role/${DEPLOY_ECS_EXECUTION_ROLE_NAME}} \
+            ${DEPLOY_TASK_ROLE_NAME:+ --task-role-arn arn:aws:iam::${DEPLOY_AWS_ACCOUNT}:role/${DEPLOY_TASK_ROLE_NAME}} \
+            | $JQ '.taskDefinition.taskDefinitionArn' \
+    )
+
+    if [[ -z "$revision_target" ]] ; then
         echo "Failed to register task definition"
         exit 1
     fi
     echo "Target Revision: $revision_target"
+
+    if [ ! -z "${DEPLOY_NO_SERVICE}" ] ; then
+      echo "Skipping service deploy, DEPLOY_NO_SERVICE: ${DEPLOY_NO_SERVICE}"
+      return 0
+    fi
 
     echo
     echo Updating service
@@ -305,7 +398,7 @@ function ecs_deploy_task () {
             | $JQ '.service.taskDefinition' \
         )
 
-    if [ "$revision_target" != "$revision_actual" ] ; then
+    if [[ "$revision_target" != "$revision_actual" ]] ; then
         echo "Error updating service. Target does not match actual: ${revision_target} != ${revision_actual} "
         exit 1
     fi
@@ -321,7 +414,7 @@ function ecs_verify_deploy () {
 
     local subfamily="$1"
 
-    if [ -z "$subfamily" ] ; then
+    if [[ -z "$subfamily" ]] ; then
         family="${DEPLOY_APP_NAME}"
         service="${DEPLOY_APP_NAME}"
     else
@@ -339,17 +432,17 @@ function ecs_verify_deploy () {
     echo
 
     # wait for older revisions to disappear
-    for attempt in {1..60}; do
+    for attempt in {1..100}; do
 
         revision_deployed=$( \
             aws ecs describe-services \
                 --profile ${DEPLOY_AWS_PROFILE} \
                 --cluster ${DEPLOY_ECS_CLUSTER_NAME} \
                 --services ${service} \
-                | $JQ ".services[0].deployments | .[] | select(.taskDefinition != \"$revision_target\") | .taskDefinition" \
-            )
+            | $JQ ".services[0].deployments | .[] | select(.taskDefinition != \"$revision_target\") | .taskDefinition" \
+        )
 
-        if [ -z "$revision_deployed" ] ; then
+        if [[ -z "$revision_deployed" ]] ; then
             echo "Success: Deployed!"
             return 0
         fi
@@ -365,73 +458,20 @@ function ecs_verify_deploy () {
     exit 1
 }
 
+function ecs_deploy () {
 
-##
-## public functions
-##
+  # check environment variables
+  check_environment
 
-function docker_build {
+  # setup aws
+  aws_configure
+  ecr_login
 
-    echo
-    echo Building docker image
-    echo DEPLOY_DOCKERFILE: ${DEPLOY_DOCKERFILE}
-    echo DEPLOY_DOCKER_LOCAL_TAG: ${DEPLOY_DOCKER_LOCAL_TAG}
-    echo
-
-    if [ -z "${DEPLOY_DOCKERFILE}" ] ; then
-        echo "Error: DEPLOY_DOCKERFILE is required"
-        return 1
-    fi
-
-    if [ -z "${DEPLOY_DOCKER_LOCAL_TAG}" ] ; then
-        echo "Error: DEPLOY_DOCKER_LOCAL_TAG is required"
-        return 1
-    fi
-
-    if [[ ! -z "${DEPLOY_GITHUB_MACHINE_USER_KEY_FINGERPRINT}" ]] ; then
-
-        fingerprint="$( echo ${DEPLOY_GITHUB_MACHINE_USER_KEY_FINGERPRINT} | tr -d : )"
-
-        eval keyfile="~/.ssh/id_${fingerprint}"
-
-        if [[ ! -f ${keyfile} ]] ; then
-            echo "Error: Unable to find machine user key file"
-            echo "- fingerprint: ${fingerprint}"
-            echo "- keyfile: ${keyfile}"
-
-            eval keyfile="~/.ssh/id_circleci_github"
-
-            if [[ ! -f ${keyfile} ]] ; then
-                echo "Error: Unable to find circle github key file"
-                echo "- keyfile: ${keyfile}"
-                return 1
-            fi
-
-        fi
-
-        echo "Using GITHUB_MACHINE_USER_KEY=${keyfile}"
-
-        docker build \
-            --rm=false \
-            --no-cache \
-            --build-arg GITHUB_MACHINE_USER_KEY="$(< ${keyfile} )" \
-            -t ${DEPLOY_DOCKER_LOCAL_TAG} \
-            -f ${DEPLOY_DOCKERFILE} \
-            .
-
-    else
-
-        docker build \
-            --rm=false \
-            -t ${DEPLOY_DOCKER_LOCAL_TAG} \
-            -f ${DEPLOY_DOCKERFILE} \
-            .
-
-    fi
-
+  _ecs_deploy_image
+  _ecs_update_service
 }
 
-function ecs_deploy () {
+function ecs_deploy_image () {
 
     # check environment variables
     check_environment
@@ -440,14 +480,45 @@ function ecs_deploy () {
     aws_configure
     ecr_login
 
+    _ecs_deploy_image
+}
+
+function ecs_update_service () {
+
+    # check environment variables
+    check_environment
+
+    # setup aws
+    aws_configure
+    ecr_login
+
+    _ecs_update_service
+}
+
+
+function _get_target_image_tag() {
+
+  local local_target_tag="${DEPLOY_CURRENT_TIME}-${DEPLOY_SHA1}"
+
+  if [ ! -z "$DEPLOY_ADD_ENV_TO_TAG" ]; then
+    local_target_tag="${local_target_tag}-${DEPLOY_ADD_ENV_TO_TAG:-$FLM_ENV}"
+  fi
+
+  echo $local_target_tag
+}
+
+function _ecs_deploy_image () {
+
     #
     # push images
     #
 
-    if [ ! -z "${DEPLOY_RETAG_AND_PUSH}" ] ; then
+    local ecr_repo_name="${DEPLOY_ECR_REPO:-$DEPLOY_APP_NAME}"
 
-        remote_tag="${DEPLOY_ECR_HOST}/${DEPLOY_APP_NAME}:${DEPLOY_RETAG_REMOTE_TAG}"
-        target_tag="${DEPLOY_ECR_HOST}/${DEPLOY_APP_NAME}:${DEPLOY_RETAG_TARGET_TAG}"
+    if [[ ! -z "${DEPLOY_RETAG_AND_PUSH}" ]] ; then
+
+        remote_tag="${DEPLOY_ECR_HOST}/${ecr_repo_name}:${DEPLOY_RETAG_REMOTE_TAG}"
+        target_tag="${DEPLOY_ECR_HOST}/${ecr_repo_name}:${DEPLOY_RETAG_TARGET_TAG}"
 
         echo
         echo DEPLOY_RETAG_AND_PUSH: ${DEPLOY_RETAG_AND_PUSH}
@@ -469,7 +540,7 @@ function ecs_deploy () {
 
     else
 
-        target_tag="${DEPLOY_ECR_HOST}/${DEPLOY_APP_NAME}:$( date +%Y%m%d )-${DEPLOY_SHA1}"
+        target_tag="${DEPLOY_ECR_HOST}/${ecr_repo_name}:$(_get_target_image_tag)"
 
         echo
         echo Pushing primary tag
@@ -483,9 +554,9 @@ function ecs_deploy () {
         ecr_push_image \
             $target_tag
 
-        if [ ! -z "$DEPLOY_PUSH_SECONDARY_TAG" ] ; then
+        if [[ ! -z "$DEPLOY_PUSH_SECONDARY_TAG" ]] ; then
 
-            secondary_tag="${DEPLOY_ECR_HOST}/${DEPLOY_APP_NAME}:${DEPLOY_PUSH_SECONDARY_TAG}"
+            secondary_tag="${DEPLOY_ECR_HOST}/${ecr_repo_name}:${DEPLOY_PUSH_SECONDARY_TAG}"
 
             echo
             echo Pushing secondary tag
@@ -504,26 +575,32 @@ function ecs_deploy () {
 
     fi
 
-    if [ -z "${DEPLOY_IMAGE}" ] ; then
+    if [[ -z "${DEPLOY_IMAGE}" ]] ; then
         echo "Error: deploy image is undefined, DEPLOY_IMAGE=${DEPLOY_IMAGE}"
         exit 1
     fi
+
+}
+
+function _ecs_update_service() {
+
+    DEPLOY_IMAGE_TAG="${DEPLOY_IMAGE_TAG:-$(_get_target_image_tag)}"
 
     #
     # deploy task defs
     #
 
     # deploy all the tasks first...
-    if [ -z "$DEPLOY_ECS_FAMILIES" ] ; then
+    if [[ -z "$DEPLOY_ECS_FAMILIES" ]] ; then
 
-        ecs_deploy_task $DEPLOY_IMAGE
+        ecs_deploy_task $DEPLOY_IMAGE_TAG
         ecs_verify_deploy
 
     else
 
         for family in $DEPLOY_ECS_FAMILIES
         do
-            ecs_deploy_task $DEPLOY_IMAGE $family
+            ecs_deploy_task $DEPLOY_IMAGE_TAG $family
         done
 
         for family in $DEPLOY_ECS_FAMILIES
@@ -535,28 +612,47 @@ function ecs_deploy () {
 
 }
 
-function package_lambda () {
 
-    DEPLOY_LAMBDA_SOURCE_DIR="${DEPLOY_LAMBDA_SOURCE_DIR:-.}"
+##
+## lamdba
+##
 
-    DEPLOY_LAMBDA_ZIP_DIR="${DEPLOY_LAMBDA_ZIP_DIR:-/tmp/deploy_artifacts}"
-    mkdir -p ${DEPLOY_LAMBDA_ZIP_DIR}
+function _lambda_init_zip_vars () {
 
-    if [ -z "${DEPLOY_LAMBDA_ZIP_FILENAME}" ] ; then
-        DEPLOY_LAMBDA_ZIP_FILENAME="${DEPLOY_LAMBDA_FUNCTION_NAME}.zip"
+    # check environment variables
+    if [[ -z "${DEPLOY_LAMBDA_FUNCTION_NAME}" ]] ; then
+        echo "Error: DEPLOY_LAMBDA_FUNCTION_NAME is required"
+        exit 1
     fi
 
-    DEPLOY_LAMBDA_ZIP_FULLPATH="${DEPLOY_LAMBDA_ZIP_DIR}/${DEPLOY_LAMBDA_ZIP_FILENAME}"
+    if [[ -z "${DEPLOY_LAMBDA_ZIP_FULLPATH}" ]] ; then
+        DEPLOY_LAMBDA_ZIP_DIR="${DEPLOY_LAMBDA_ZIP_DIR:-/tmp/deploy_artifacts}"
+        mkdir -p ${DEPLOY_LAMBDA_ZIP_DIR}
 
-    if [ -z "${DEPLOY_DEBUG}" ] ; then
+        if [[ -z "${DEPLOY_LAMBDA_ZIP_FILENAME}" ]] ; then
+            DEPLOY_LAMBDA_ZIP_FILENAME="${DEPLOY_LAMBDA_FUNCTION_NAME}.zip"
+        fi
+
+        DEPLOY_LAMBDA_ZIP_FULLPATH="${DEPLOY_LAMBDA_ZIP_DIR}/${DEPLOY_LAMBDA_ZIP_FILENAME}"
+    fi
+
+    if [[ -z "${DEPLOY_DEBUG}" ]] ; then
         DEPLOY_LAMBDA_ZIP_QUIET="-q"
     else
         DEPLOY_LAMBDA_ZIP_QUIET=""
     fi
 
+}
+
+function lambda_package_zip () {
+
+    _lambda_init_zip_vars
+
+    DEPLOY_LAMBDA_SOURCE_DIR="${DEPLOY_LAMBDA_SOURCE_DIR:-.}"
+
     # zip into deploy package
-    pushd "${DEPLOY_LAMBDA_FUNCTION_SOURCE_DIR:-.}"
-    zip ${DEPLOY_LAMBDA_ZIP_QUIET} -r ${DEPLOY_LAMBDA_ZIP_FULLPATH} ${DEPLOY_LAMBDA_SOURCE_DIR} -x "*.git*"
+    pushd "${DEPLOY_LAMBDA_SOURCE_DIR:-.}"
+    zip ${DEPLOY_LAMBDA_ZIP_QUIET} -r ${DEPLOY_LAMBDA_ZIP_FULLPATH} . -x "*.git*"
     popd
 
     if [[ "$?" != "0" ]] ; then
@@ -566,49 +662,124 @@ function package_lambda () {
 
 }
 
-function copy_lambda_to_s3 () {
+function lambda_copy_zip_to_s3 () {
 
     aws_configure
 
-    aws --profile "${DEPLOY_AWS_PROFILE}" \
-        s3 cp \
-        ${DEPLOY_LAMBDA_ZIP_FULLPATH} \
-        s3://${DEPLOY_LAMBDA_S3_BUCKET}/${DEPLOY_LAMBDA_FUNCTION_NAME}/archive/${DEPLOY_LAMBDA_FUNCTION_NAME}-${DEPLOY_SHA1}.zip
+    _lambda_init_zip_vars
 
-    if [[ "$?" != "0" ]] ; then
-        echo "Error: Failed to copy lambda zip to S3 (${DEPLOY_SHA1})"
+    if [[ -z "${DEPLOY_LAMBDA_S3_BUCKET}" ]] ; then
+        echo "Error: DEPLOY_LAMBDA_S3_BUCKET is required"
         exit 1
     fi
 
-    if [ ! -z "${DEPLOY_LAMBDA_ZIP_VERSION}" ] ; then
-      aws --profile "${DEPLOY_AWS_PROFILE}" \
-          s3 cp \
-          ${DEPLOY_LAMBDA_ZIP_FULLPATH} \
-          s3://${DEPLOY_LAMBDA_S3_BUCKET}/${DEPLOY_LAMBDA_FUNCTION_NAME}/${DEPLOY_LAMBDA_FUNCTION_NAME}-${DEPLOY_LAMBDA_ZIP_VERSION}.zip
+    # copy to version-specific or commit-hash key
+    if [[ ! -z "${DEPLOY_LAMBDA_ZIP_VERSION}" ]] ; then
+        aws --profile "${DEPLOY_AWS_PROFILE}" \
+            s3 cp \
+            ${DEPLOY_LAMBDA_ZIP_FULLPATH} \
+            s3://${DEPLOY_LAMBDA_S3_BUCKET}/${DEPLOY_LAMBDA_FUNCTION_NAME}/archive/${DEPLOY_LAMBDA_FUNCTION_NAME}-${DEPLOY_LAMBDA_ZIP_VERSION}.zip
 
-      if [[ "$?" != "0" ]] ; then
-          echo "Error: Failed to copy lambda zip to S3 (${DEPLOY_LAMBDA_ZIP_VERSION})"
-          exit 1
-      fi
+        if [[ "$?" != "0" ]] ; then
+            echo "Error: Failed to copy lambda zip to S3 (${DEPLOY_LAMBDA_ZIP_VERSION})"
+            exit 1
+        fi
+
+    elif [[ ! -z "${DEPLOY_SHA1}" ]] ; then
+        aws --profile "${DEPLOY_AWS_PROFILE}" \
+            s3 cp \
+            ${DEPLOY_LAMBDA_ZIP_FULLPATH} \
+            s3://${DEPLOY_LAMBDA_S3_BUCKET}/${DEPLOY_LAMBDA_FUNCTION_NAME}/archive/${DEPLOY_LAMBDA_FUNCTION_NAME}-${DEPLOY_SHA1}.zip
+
+        if [[ "$?" != "0" ]] ; then
+            echo "Error: Failed to copy lambda zip to S3 (${DEPLOY_SHA1})"
+            exit 1
+        fi
+    fi
+
+    # copy to latest key
+    aws --profile "${DEPLOY_AWS_PROFILE}" \
+        s3 cp \
+        ${DEPLOY_LAMBDA_ZIP_FULLPATH} \
+        s3://${DEPLOY_LAMBDA_S3_BUCKET}/${DEPLOY_LAMBDA_FUNCTION_NAME}/${DEPLOY_LAMBDA_FUNCTION_NAME}.zip
+
+    if [[ "$?" != "0" ]] ; then
+        echo "Error: Failed to copy lambda zip to S3 (latest)"
+        exit 1
+    fi
+
+}
+
+function lambda_update_from_s3 () {
+
+    # check environment variables
+    if [[ -z "${DEPLOY_AWS_ACCOUNT}" ]] ; then
+        echo "Error: DEPLOY_AWS_ACCOUNT is required"
+        exit 1
+    fi
+
+    if [[ -z "${DEPLOY_LAMBDA_FUNCTION_NAME}" ]] ; then
+        echo "Error: DEPLOY_LAMBDA_FUNCTION_NAME is required"
+        exit 1
+    fi
+
+    if [[ -z "${DEPLOY_LAMBDA_S3_BUCKET}" ]] ; then
+        echo "Error: DEPLOY_LAMBDA_S3_BUCKET is required"
+        exit 1
+    fi
+
+    # setup aws
+    aws_configure
+
+    # update lambda function
+    lambda_function_sha256=$( \
+        aws lambda update-function-code \
+            --profile "${DEPLOY_AWS_PROFILE}" \
+            --function-name "${DEPLOY_LAMBDA_TARGET_FUNCTION_NAME:-$DEPLOY_LAMBDA_FUNCTION_NAME}" \
+            --s3-bucket "${DEPLOY_LAMBDA_S3_BUCKET}" \
+            --s3-key "${DEPLOY_LAMBDA_FUNCTION_NAME}/${DEPLOY_LAMBDA_FUNCTION_NAME}.zip" \
+        | $JQ ".CodeSha256"
+    )
+
+    if [[ -z "${lambda_function_sha256}" ]] ; then
+        echo "Error: Failed to update lambda function"
+        exit 1
+    fi
+
+    if [[ ! -z "${DEPLOY_LAMBDA_ZIP_VERSION}" ]] ; then
+
+        lambda_function_version=$( \
+            aws lambda publish-version \
+                --profile "${DEPLOY_AWS_PROFILE}" \
+                --function-name "${DEPLOY_LAMBDA_TARGET_FUNCTION_NAME:-$DEPLOY_LAMBDA_FUNCTION_NAME}" \
+                --description "${DEPLOY_LAMBDA_ZIP_VERSION} created by deployables" \
+                --code-sha-256 "${lambda_function_sha256}" \
+            | $JQ ".Version"
+        )
+
+        if [[ -z "${lambda_function_version}" ]] ; then
+        echo "Error: Failed to publish lambda version"
+            exit 1
+        fi
 
     fi
 
 }
 
-function deploy_lambda () {
+function lambda_deploy () {
 
     # check environment variables
-    if [ -z "${DEPLOY_AWS_ACCOUNT}" ] ; then
+    if [[ -z "${DEPLOY_AWS_ACCOUNT}" ]] ; then
         echo "Error: DEPLOY_AWS_ACCOUNT is required"
         exit 1
     fi
 
-    if [ -z "${DEPLOY_LAMBDA_FUNCTION_NAME}" ] ; then
+    if [[ -z "${DEPLOY_LAMBDA_FUNCTION_NAME}" ]] ; then
         echo "Error: DEPLOY_LAMBDA_FUNCTION_NAME is required"
         exit 1
     fi
 
-    if [ -z "${DEPLOY_LAMBDA_FUNCTION_ROLE}" ] ; then
+    if [[ -z "${DEPLOY_LAMBDA_FUNCTION_ROLE}" ]] ; then
         echo "Error: DEPLOY_LAMBDA_FUNCTION_ROLE is required"
         exit 1
     fi
@@ -617,36 +788,48 @@ function deploy_lambda () {
     aws_configure
 
     # zip the
-    package_lambda
+    if [[ ! -z "${DEPLOY_LAMBDA_ZIP_FULLPATH}" ]] && [[ -f "${DEPLOY_LAMBDA_ZIP_FULLPATH}" ]] ; then
+        echo "Skipping ... Zip already exists at ${DEPLOY_LAMBDA_ZIP_FULLPATH}"
+    else
+        lambda_package_zip
+    fi
 
-    lamdba_runtime="${DEPLOY_LAMBDA_FUNCTION_RUNTIME:-nodejs4.3}"
+    lamdba_runtime="${DEPLOY_LAMBDA_FUNCTION_RUNTIME:-nodejs6.10}"
     lamdba_handler="${DEPLOY_LAMBDA_FUNCTION_HANDLER:-index.handler}"
     lambda_role="arn:aws:iam::${DEPLOY_AWS_ACCOUNT}:role/${DEPLOY_LAMBDA_FUNCTION_ROLE}"
     lambda_timeout="${DEPLOY_LAMBDA_FUNCTION_TIMEOUT:-3}"
+    lambda_memory_size="${DEPLOY_LAMBDA_FUNCTION_MEMORY_SIZE:-128}"
 
     lambda_env_template="${DEPLOY_LAMBDA_FUNCTION_ENV_TEMPLATE:-environment.txt}"
 
-    lambda_env=$( \
-        ${DEPLOY_ENVSUBST_COMMAND:-envsubst} < "${lambda_env_template}"
-    )
+    if [[ -f ${lambda_env_template} ]] ; then
+      lambda_env=$( \
+          ${DEPLOY_ENVSUBST_COMMAND:-envsubst} < "${lambda_env_template}"
+      )
+    fi
 
     # create lambda function
+    echo "Info: Attemping to create lambda function"
+
     lambda_function_arn=$( \
         aws lambda create-function \
             --profile "${DEPLOY_AWS_PROFILE}" \
             --function-name "${DEPLOY_LAMBDA_FUNCTION_NAME}" \
             --description "${DEPLOY_LAMBDA_FUNCTION_DESCRIPTION}" \
             --timeout "${lambda_timeout}" \
+            --memory-size "${lambda_memory_size}" \
             --role "${lambda_role}" \
             --handler "${lamdba_handler}" \
             --runtime "${lamdba_runtime}" \
-            --environment "${lambda_env}" \
-            --zip-file "fileb://${${DEPLOY_LAMBDA_ZIP_FULLPATH}}" \
-            | $JQ ".FunctionArn"
+            ${lambda_env:+ --environment "${lambda_env}"} \
+            --zip-file "fileb://${DEPLOY_LAMBDA_ZIP_FULLPATH}" \
+        | $JQ ".FunctionArn"
     )
 
     # try to update the lamda function if creation failed
     if [[ -z "$lambda_function_arn" ]] ; then
+
+        echo "Info: Attemping to update existing lambda function"
 
         lambda_function_arn=$( \
             aws lambda update-function-configuration \
@@ -654,18 +837,47 @@ function deploy_lambda () {
                 --function-name "${DEPLOY_LAMBDA_FUNCTION_NAME}" \
                 --description "${DEPLOY_LAMBDA_FUNCTION_DESCRIPTION}" \
                 --timeout "${lambda_timeout}" \
+                --memory-size "${lambda_memory_size}" \
                 --role "${lambda_role}" \
                 --handler "${lamdba_handler}" \
-                --environment "${lambda_env}" \
+                ${lambda_env:+ --environment "${lambda_env}"} \
                 --runtime "${lamdba_runtime}" \
-                | $JQ ".FunctionArn"
+            | $JQ ".FunctionArn"
         )
 
         # update lambda function
-        aws lambda update-function-code \
-            --profile "${DEPLOY_AWS_PROFILE}" \
-            --function-name "${DEPLOY_LAMBDA_FUNCTION_NAME}" \
-            --zip-file "fileb://${${DEPLOY_LAMBDA_ZIP_FULLPATH}}"
+        lambda_function_sha256=$( \
+          aws lambda update-function-code \
+              --profile "${DEPLOY_AWS_PROFILE}" \
+              --function-name "${DEPLOY_LAMBDA_FUNCTION_NAME}" \
+              --zip-file "fileb://${DEPLOY_LAMBDA_ZIP_FULLPATH}" \
+          | $JQ ".CodeSha256"
+        )
+
+        if [[ -z "${lambda_function_sha256}" ]] ; then
+            echo "Error: Failed to update lambda function"
+            exit 1
+        fi
+
+        if [[ ! -z "${DEPLOY_LAMBDA_PUBLISH_NEW_VERSION}" ]] ; then
+
+            echo "Info: Attemping to publish new version of the lambda function"
+
+            lambda_function_version=$( \
+                aws lambda publish-version \
+                    --profile "${DEPLOY_AWS_PROFILE}" \
+                    --function-name "${DEPLOY_LAMBDA_FUNCTION_NAME}" \
+                    --description "New version published by deployables" \
+                    --code-sha-256 "${lambda_function_sha256}" \
+                | $JQ ".Version"
+            )
+
+            if [[ -z "${lambda_function_version}" ]] ; then
+                echo "Error: Failed to publish lambda version"
+                exit 1
+            fi
+
+        fi
 
     fi
 
@@ -674,43 +886,45 @@ function deploy_lambda () {
         exit 1
     fi
 
-    deploy_lambda_event \
-        $DEPLOY_LAMBDA_EVENT_BASENAME \
-        $lambda_function_arn
+    if [[ ! -z "${DEPLOY_LAMBDA_EVENT_RULE}" ]] ; then
+        DEPLOY_LAMBDA_FUNCTION_ARN="${lambda_function_arn}"
+        DEPLOY_LAMBDA_EVENT_BASENAME="${DEPLOY_LAMBDA_EVENT_BASENAME:-$DEPLOY_LAMBDA_FUNCTION_NAME}"
+        lambda_deploy_event
+    fi
+
+    echo "Info: lambda_deploy completed"
 }
 
-function deploy_lambda_event {
+function lambda_deploy_event () {
+    lambda_event_basename="${1:-$DEPLOY_LAMBDA_EVENT_BASENAME}"
+    if [[ -z "${lambda_event_basename}" ]] ; then
+        echo "Error: DEPLOY_LAMBDA_EVENT_BASENAME or passing the basename is required for lambda_deploy_event."
+        return
+    fi
+
+    lambda_function_arn="${DEPLOY_LAMBDA_FUNCTION_ARN}"
+    if [[ -z "${lambda_function_arn}" ]] ; then
+        echo "Info: No DEPLOY_LAMBDA_FUNCTION_ARN, not deploying event."
+        return
+    fi
+
     if [[ -z "${DEPLOY_LAMBDA_EVENT_RULE}" ]] ; then
         echo "Info: No DEPLOY_LAMBDA_EVENT_RULE, not deploying event."
         return
     fi
 
     if [[ -z "${DEPLOY_LAMBDA_TARGET_INPUT_JSON}" ]] ; then
-        echo "Info: No DEPLOY_LAMBDA_TARGET_INPUT_JSON, not deploying event."
-        return
+        echo "Info: No DEPLOY_LAMBDA_TARGET_INPUT_JSON, using default: {}"
+        DEPLOY_LAMBDA_TARGET_INPUT_JSON="{}"
     fi
 
     aws_configure
 
-    lambda_event_basename="${1:-$DEPLOY_LAMBDA_EVENT_BASENAME}"
-    lambda_function_arn="${2:-$DEPLOY_LAMBDA_FUNCTION_ARN}"
     event_rule_name="${lambda_event_basename}_rule"
     permission_statement_id="${lambda_event_basename}_permission"
 
-    # this json is a sub-json to something else, so we need to escape the quotes because
-    # the aws cli is stupid
+    # this json is a sub-json to something else, so we need to escape the quotes for the awscli
     input_json_escaped=${DEPLOY_LAMBDA_TARGET_INPUT_JSON//\"/\\\"}
-
-    if [ -z "${lambda_function_arn}" ] ; then
-        echo "Error: DEPLOY_LAMBDA_FUNCTION_ARN or passing a 'lambda_function_arn' is required for deploy_lambda_event."
-        exit 1
-    fi
-
-    if [[ -z "${lambda_event_basename}" ]] ; then
-        echo "Error: DEPLOY_LAMBDA_EVENT_BASENAME or passing the basename is required for deploy_lambda_event."
-        exit 1
-    fi
-
 
     # create or update a cloudwatch event rule
     event_rule_arn=$( \
@@ -718,7 +932,7 @@ function deploy_lambda_event {
             --profile "${DEPLOY_AWS_PROFILE}" \
             --name "${event_rule_name}" \
             --schedule-expression "${DEPLOY_LAMBDA_EVENT_RULE}" \
-            | $JQ ".RuleArn"
+        | $JQ ".RuleArn"
     )
 
     # NB this can fail if the permission doesn't exist, this is ok.
@@ -742,7 +956,7 @@ function deploy_lambda_event {
             --profile "${DEPLOY_AWS_PROFILE}" \
             --rule "${event_rule_name}" \
             --targets "[{ \"Id\" : \"${lambda_event_basename}_target\", \"Arn\": \"${lambda_function_arn}\" ${DEPLOY_LAMBDA_TARGET_INPUT_JSON:+,\"Input\": \"${input_json_escaped}\"}}]" \
-            | $JQ ".FailedEntryCount"
+        | $JQ ".FailedEntryCount"
     )
 
     if [[ "${failed_entry_count}" != "0" ]] ; then
@@ -750,6 +964,17 @@ function deploy_lambda_event {
         exit 1
     fi
 }
+
+function deploy_lambda () {
+    echo "Deprecated: Please use lambda_deploy()"
+    lambda_deploy
+}
+
+function deploy_lambda_event () {
+    echo "Deprecated: Please use lambda_deploy_event()"
+    lambda_deploy_event
+}
+
 
 ##
 ## MAIN
