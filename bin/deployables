@@ -320,7 +320,7 @@ function ecs_update_task_image () {
     task_def=$( \
             echo ${previous_task} | $JQ --arg IMAGE "${image}" '.taskDefinition.containerDefinitions[0].image = $IMAGE' \
             | $JQ '.taskDefinition' \
-            | $JQ 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities)'
+            | $JQ 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredBy, .registeredAt)'
     )
 
     echo ${task_def}> fulltask_${family}.json
